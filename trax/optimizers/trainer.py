@@ -362,6 +362,16 @@ class ReversibleSerialTrainer:
       return tl.on_cpu(x)
     return tl.on_cpu(fastmath.nested_map(lambda x: x[0], x))
 
+  def _lazy_unreplicate(self, x):
+    def unreplicate_and_start_async_copy(y):
+      unreplicated = y if self._n_devices == 1 else y[0]
+      unreplicated.copy_to_host_async()
+      return unreplicated
+    return fastmath.nested_map(unreplicate_and_start_async_copy, x)
+
+  def _collect_weights(self, layer):
+    layer.weights = fastmath.nested_map(lambda x: x._value, layer.weights)  # pylint: disable=protected-access
+
   def _per_device_rngs(self, rng):
     """Create per-device RNGs from a given rng."""
     # Splitting by device first to be identical with default trainer.
@@ -476,6 +486,12 @@ class ReversibleSerialTrainer:
           std_inputs, stack, std_layer.n_out)
       stats.append(std_layer_stats)
 
+    # Collect lazily unreplicated layer weights.
+    for i in range(len(self._blocks) - 1, -1, -1):
+      std_layer, rev_layers = self._blocks[i]
+      for l in [std_layer] + rev_layers:
+        self._collect_weights(l)
+
     # Join stats from different optimizers into one.
     joint_stats = {}
     for i, stat in enumerate(reversed(stats)):
@@ -526,7 +542,7 @@ class ReversibleSerialTrainer:
     weights = self._replicate(layer.weights)
     new_weights, new_state, new_slots, new_grads, stats = fbo_fn(
         inp, weights, grads, state, slots, replicated_opt_params, rng, step)
-    layer.weights = self._unreplicate(new_weights)
+    layer.weights = self._lazy_unreplicate(new_weights)
     layer.state = self._unreplicate(new_state)
     optimizer.slots = self._unreplicate(new_slots)
     if grad_stack is not None:
@@ -567,7 +583,7 @@ class ReversibleSerialTrainer:
     new_weights, new_slots, inputs, grads, layer_stats = reverse_and_fbo(
         outputs, weights, grads, old_state, new_state,
         slots, opt_params, rng, step)
-    layer.weights = self._unreplicate(new_weights)  # accelerator -> cpu
+    layer.weights = self._lazy_unreplicate(new_weights)  # accelerator -> cpu
     layer.state = self._unreplicate(new_state)
     optimizer.slots = self._unreplicate(new_slots)
     stack = cb.outputs_onto_stack(inputs, stack, layer.n_out)
